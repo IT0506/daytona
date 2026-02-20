@@ -90,6 +90,8 @@ export interface DaytonaConfig {
   target?: string
   /** Configuration for experimental features */
   _experimental?: Record<string, any>
+  /** Default timeout in seconds for SDK operations (0 = no timeout). Default is 60 */
+  timeout?: number
 }
 
 /**
@@ -242,6 +244,7 @@ export class Daytona implements AsyncDisposable {
   // Toolbox proxy cache per region
   private readonly toolboxProxyCache = new Map<string, Promise<string>>()
   private otelSdk?: NodeSDK
+  private readonly defaultTimeout: number
   public readonly volume: VolumeService
   public readonly snapshot: SnapshotService
 
@@ -286,7 +289,9 @@ export class Daytona implements AsyncDisposable {
     }
 
     this.apiUrl = apiUrl || 'https://app.daytona.io/api'
-
+    this.defaultTimeout =
+  config?.timeout !== undefined && config?.timeout !== null
+    ? config.timeout: 60
     const orgHeader: Record<string, string> = {}
     if (!this.apiKey) {
       if (!this.organizationId) {
@@ -435,10 +440,11 @@ export class Daytona implements AsyncDisposable {
   ): Promise<Sandbox> {
     const startTime = Date.now()
 
-    options = typeof options === 'number' ? { timeout: options } : { ...options }
-    if (options.timeout == undefined || options.timeout == null) {
-      options.timeout = 60
-    }
+   options = typeof options === 'number' ? { timeout: options } : { ...options }
+
+if (options.timeout === undefined || options.timeout === null) {
+  options.timeout = this.defaultTimeout
+}
 
     if (params == null) {
       params = { language: 'python' }
@@ -558,11 +564,27 @@ export class Daytona implements AsyncDisposable {
         const response = await this.sandboxApi.getBuildLogsUrl(sandboxInstance.id)
 
         await processStreamingResponse(
-          () =>
-            fetch(response.data.url + '?follow=true', {
-              method: 'GET',
-              headers: this.clientConfig.baseOptions.headers,
-            }),
+  () => {
+    const controller = new AbortController()
+
+    let timeoutId: NodeJS.Timeout | undefined
+
+    const effectiveTimeout = options.timeout ?? this.defaultTimeout
+
+    if (effectiveTimeout && effectiveTimeout > 0) {
+      timeoutId = setTimeout(() => {
+        controller.abort()
+      }, effectiveTimeout * 1000)
+    }
+
+    return fetch(response.data.url + '?follow=true', {
+      method: 'GET',
+      headers: this.clientConfig.baseOptions.headers,
+      signal: controller.signal,
+    }).finally(() => {
+      if (timeoutId) clearTimeout(timeoutId)
+    })
+  },
           (chunk) => options.onSnapshotCreateLogs?.(chunk.trimEnd()),
           async () => {
             sandboxInstance = (await this.sandboxApi.getSandbox(sandboxInstance.id)).data
@@ -765,8 +787,11 @@ export class Daytona implements AsyncDisposable {
 
   private createAxiosInstance(): AxiosInstance {
     const axiosInstance = axios.create({
-      timeout: 24 * 60 * 60 * 1000, // 24 hours
-    })
+  timeout:
+    this.defaultTimeout && this.defaultTimeout > 0
+      ? this.defaultTimeout * 1000
+      : 0, // 0 = no timeout
+})
 
     // Request interceptor: Inject trace context into headers
     axiosInstance.interceptors.request.use(
